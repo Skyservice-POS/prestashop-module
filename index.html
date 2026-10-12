@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Service Ready</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' transform='rotate(-30 7 8)' viewBox='0 0 14 16' width='50'%3E%3Cpath fill='%23eee' d='M.377 13.484h8.466c1.374 0 1.439-1.092 1.439-1.596 0-.586-.152-1.257-1.483-1.655L2.776 8.41c-.239-.063-1.199-.377-1.81-1.091C.268 6.521.181 5.369.181 4.55c0-.881.109-1.95.981-2.727.785-.711 1.768-.818 2.51-.818h8.792v2.203H4.653c-.392 0-.851.021-1.199.336-.371.335-.392.859-.392 1.132 0 .651.196 1.279 1.417 1.657l5.585 1.699c1.024.315 1.724.63 2.181 1.048.917.839 1.004 2.141 1.004 2.831 0 .923-.131 1.952-.763 2.729-.764.943-1.724 1.047-2.727 1.047H.377v-2.203z'/%3E%3C/svg%3E"),linear-gradient(184deg,#d3d3d3,#f0f0f0 80%);
+            background-repeat: repeat;
+            background-size: cover;
+            background-position: 50%,50%;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+
+        .container {
+            background: transparent;
+            border-radius: 20px;
+            padding: 60px 40px;
+            text-align: center;
+            max-width: 600px;
+            width: 100%;
+            animation: fadeIn 0.6s ease-in-out, float 6s ease-in-out infinite;
+        }
+
+        @keyframes fadeIn {
+            from {
+                opacity: 0;
+                transform: translateY(20px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        @keyframes float {
+            0%, 100% {
+                transform: translateY(0px) translateX(0px);
+            }
+            25% {
+                transform: translateY(-10px) translateX(5px);
+            }
+            50% {
+                transform: translateY(-5px) translateX(-5px);
+            }
+            75% {
+                transform: translateY(-15px) translateX(3px);
+            }
+        }
+
+        .icon {
+            font-size: 64px;
+            margin-bottom: 24px;
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% {
+                transform: scale(1);
+            }
+            50% {
+                transform: scale(1.05);
+            }
+        }
+
+        h1 {
+            color: #2d3748;
+            font-size: 28px;
+            font-weight: 600;
+            margin-bottom: 16px;
+            line-height: 1.4;
+        }
+
+        p {
+            color: #4a5568;
+            font-size: 18px;
+            line-height: 1.6;
+            margin-bottom: 32px;
+        }
+
+        .button {
+            display: inline-block;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 14px 32px;
+            border-radius: 10px;
+            text-decoration: none;
+            font-weight: 500;
+            font-size: 16px;
+            transition: transform 0.2s, box-shadow 0.2s;
+            box-shadow: 0 4px 15px rgba(102, 126, 234, 0.4);
+        }
+
+        .button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 20px rgba(102, 126, 234, 0.6);
+        }
+
+        .status {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            background: #d4edda;
+            color: #155724;
+            padding: 8px 16px;
+            border-radius: 20px;
+            font-size: 14px;
+            font-weight: 500;
+            margin-bottom: 24px;
+        }
+
+        .status::before {
+            content: "●";
+            color: #28a745;
+            animation: blink 2s infinite;
+        }
+
+        @keyframes blink {
+            0%, 100% {
+                opacity: 1;
+            }
+            50% {
+                opacity: 0.3;
+            }
+        }
+
+        .logo {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            z-index: 10;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1 id="title">Your service is ready</h1>
+        <p id="description">To manage, go to the developer cabinet</p>
+    </div>
+
+    <script>
+        const translations = {
+            uk: {
+                title: 'Ваш сервіс готовий до роботи',
+                description: 'Для керування перейдіть до кабінету розробника',
+                pageTitle: 'Сервіс готовий'
+            },
+            ru: {
+                title: 'Ваш сервис готов к работе',
+                description: 'Для управления перейдите в кабинет разработчика',
+                pageTitle: 'Сервис готов'
+            },
+            en: {
+                title: 'Your service is ready',
+                description: 'To manage, go to the developer cabinet',
+                pageTitle: 'Service Ready'
+            }
+        };
+
+        function detectLanguage() {
+            const browserLang = navigator.language || navigator.userLanguage;
+            const langCode = browserLang.split('-')[0].toLowerCase();
+
+            return translations[langCode] ? langCode : 'en';
+        }
+
+        function setLanguage() {
+            const lang = detectLanguage();
+            const texts = translations[lang];
+
+            document.documentElement.lang = lang;
+            document.title = texts.pageTitle;
+            document.getElementById('title').textContent = texts.title;
+            document.getElementById('description').textContent = texts.description;
+        }
+
+        setLanguage();
+    </script>
+
+    <svg
+        class="logo"
+        fill="#4a5568"
+        version="1.1"
+        xmlns="http://www.w3.org/2000/svg"
+        xmlns:xlink="http://www.w3.org/1999/xlink"
+        x="0px"
+        y="0px"
+        viewBox="0 0 100 21"
+        enable-background="new 0 0 500 100"
+        xml:space="preserve"
+        style="height: 30px"
+    >
+        <filter id="dropshadow" height="130%">
+            <feGaussianBlur in="SourceAlpha" stdDeviation="0.4" />
+            <feOffset dx="0" dy="0" result="offsetblur" />
+            <feMerge>
+                <feMergeNode />
+                <feMergeNode in="SourceGraphic" />
+            </feMerge>
+            x
+        </filter>
+        <path
+            d="M0.377,13.485h8.466c1.374,0,1.439-1.092,1.439-1.596c0-0.586-0.152-1.257-1.483-1.655L2.776,8.41
+            c-0.239-0.063-1.199-0.377-1.81-1.091C0.268,6.521,0.181,5.369,0.181,4.55c0-0.881,0.109-1.95,0.981-2.727
+            c0.785-0.711,1.768-0.818,2.51-0.818h8.792v2.203H4.653c-0.392,0-0.851,0.021-1.199,0.336C3.083,3.879,3.062,4.403,3.062,4.676
+            c0,0.651,0.196,1.279,1.417,1.657l5.585,1.699c1.024,0.315,1.724,0.63,2.181,1.048c0.917,0.839,1.004,2.14,1.004,2.831
+            c0,0.923-0.131,1.952-0.763,2.729c-0.764,0.944-1.724,1.048-2.727,1.048H0.377V13.485z"
+        />
+        <path
+            d="M14.777,1.005h2.552v14.682h-2.552V1.005z M22.872,15.688l-3.994-4.068
+            c-0.328-0.337-0.785-0.902-0.785-1.679c0-0.838,0.479-1.321,0.807-1.677l3.49-3.692h2.967L21.017,9.06
+            c-0.196,0.209-0.371,0.441-0.371,0.797c0,0.356,0.262,0.734,0.546,1.028l4.734,4.803H22.872z"
+        />
+        <polygon
+            points="31.51,19.274 28.914,19.274 30.682,15.645 25.533,4.571 28.172,4.571 31.881,13.106 35.809,4.613
+            38.405,4.613 "
+        />
+        <path
+            d="M38.732,14.702h6.633c0.676,0,1.135-0.231,1.354-0.525C46.915,13.904,47,13.275,47,12.899
+            c0-0.631-0.259-0.988-0.435-1.156c-0.371-0.333-1.048-0.502-2.727-0.88l-2.007-0.44c-1.768-0.397-2.401-0.942-2.663-1.237
+            c-0.502-0.546-0.633-1.238-0.633-1.846c0-0.734,0.174-1.3,0.589-1.803c0.72-0.902,1.703-0.965,2.792-0.965h5.543v0.986h-6
+            c-0.261,0-0.917,0.021-1.287,0.378c-0.393,0.378-0.415,1.027-0.415,1.321c0,0.378,0.044,1.028,0.48,1.447
+            c0.393,0.378,1.594,0.67,1.985,0.755l2.095,0.461c1.395,0.315,2.4,0.524,3.075,1.049c0.721,0.545,0.83,1.196,0.83,1.931
+            c0,0.773-0.153,1.803-1.004,2.367c-0.567,0.378-1.353,0.421-1.81,0.421h-6.677V14.702z"
+        />
+        <path
+            d="M53.524,15.688c-0.938,0-2.159-0.231-3.054-1.363c-0.896-1.111-0.938-2.517-0.938-4.153
+            c0-1.552,0.086-3.439,1.548-4.615c1.046-0.838,2.465-0.986,3.619-0.986c0.81,0,2.009,0.106,2.948,0.63
+            c0.458,0.272,1.854,1.196,1.854,3.524c0,0.314-0.023,1.069-0.48,1.447c-0.349,0.293-0.895,0.335-1.223,0.335h-7.046
+            c-0.021,0.651,0.021,1.679,0.197,2.265c0.261,0.901,1.047,1.931,2.574,1.931h5.673v0.985H53.524z M57.8,9.521
+            c0.504,0,0.48-0.587,0.48-0.734c0-1.089-0.392-1.824-0.785-2.265c-0.829-0.944-1.963-0.965-2.988-0.965
+            c-1.156,0-2.401,0.042-3.209,1.343c-0.457,0.734-0.524,1.531-0.544,2.622H57.8z"
+        />
+        <path
+            d="M61.247,8.389c0-1.132,0.153-2.119,1.025-2.915c0.48-0.44,1.289-0.903,2.837-0.903h0.786v0.987h-0.7
+            c-0.632,0-1.592,0.063-2.223,0.775c-0.481,0.566-0.592,1.405-0.592,2.307v7.048h-1.134V8.389z"
+        />
+        <path
+            d="M70.345,14.261c0.065,0.147,0.219,0.461,0.328,0.461c0.107,0,0.263-0.313,0.326-0.461l3.73-9.69h1.158
+            l-4.016,10.278c-0.305,0.796-0.762,0.965-1.199,0.965s-0.895-0.169-1.201-0.965L65.458,4.571h1.156L70.345,14.261z"
+        />
+        <path
+            d="M76.761,1.006h1.221v1.552h-1.221V1.006z M76.804,4.571h1.134v11.117h-1.134V4.571z"
+        />
+        <path
+            d="M84.178,15.688c-1.635,0-2.727-0.631-3.404-1.405c-0.916-1.05-1.047-2.371-1.047-4.007
+            c0-1.509,0.087-3.271,1.311-4.466c0.675-0.65,1.788-1.238,3.6-1.238h3.903v0.987h-4.034c-1.855,0-2.99,0.944-3.338,2.265
+            c-0.153,0.608-0.219,2.055-0.219,2.6c0,0.735,0.108,1.993,0.393,2.622c0.675,1.468,2.357,1.658,3.402,1.658h4.059v0.985H84.178z"
+        />
+        <path
+            d="M94.104,15.688c-0.938,0-2.159-0.231-3.054-1.363c-0.895-1.111-0.938-2.517-0.938-4.153
+            c0-1.552,0.087-3.439,1.55-4.615c1.047-0.838,2.466-0.986,3.62-0.986c0.807,0,2.008,0.106,2.946,0.63
+            c0.459,0.272,1.854,1.196,1.854,3.524c0,0.314-0.023,1.069-0.48,1.447c-0.349,0.293-0.894,0.335-1.222,0.335h-7.048
+            c-0.02,0.651,0.022,1.679,0.197,2.265c0.263,0.901,1.047,1.931,2.574,1.931h5.672v0.985H94.104z M98.381,9.521
+            c0.503,0,0.479-0.587,0.479-0.734c0-1.089-0.392-1.824-0.785-2.265c-0.83-0.944-1.964-0.965-2.989-0.965
+            c-1.156,0-2.398,0.042-3.206,1.343c-0.459,0.734-0.524,1.531-0.547,2.622H98.381z"
+        />
+    </svg>
+</body>
+</html>

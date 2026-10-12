@@ -1,0 +1,44 @@
+{
+  "fullDescription": "Тут должен быть нормальный текст",
+  "badge": {
+    "text": "test *optional",
+    "background": "#ff6b6b",
+    "color": "#ffffff"
+  },
+  "benefits": [
+    {
+      "title": "1",
+      "description": "Текст 1"
+    },
+    {
+      "title": "2",
+      "description": "Текст 2"
+    }
+  ],
+  "screenshots": [
+    {
+      "url": "/example/1.png",
+      "title": "1",
+      "description": "1"
+    },
+    {
+      "url": "/example/2.png",
+      "title": "2",
+      "description": "2"
+    }
+  ],
+  "questionsAndAnswers": [
+    {
+      "question": "1",
+      "answer": "1"
+    },
+    {
+      "question": "2",
+      "answer": "2"
+    },
+    {
+      "question": "n",
+      "answer": "n"
+    }
+  ]
+}
