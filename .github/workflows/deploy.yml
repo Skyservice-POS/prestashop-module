@@ -1,0 +1,36 @@
+name: Deploy to Server
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Create project archive
+        run: |
+          zip -r project.zip . -x "*.git*" -x "image/*" -x "image"
+          ls -lh project.zip
+
+      - name: Deploy to server
+        run: |
+          curl -X POST \
+            -H "X-Deploy-Token: ${{ secrets.DEPLOY_TOKEN }}" \
+            -F "file=@project.zip" \
+            -F "deployment_id=${{ secrets.DEPLOYMENT_ID }}" \
+            "https://api.cabinet.developer.skyservice.online/index.php?section=deployments&action=autoRedeploy"
+
+      - name: Deployment status
+        if: success()
+        run: echo "✅ Deployment completed successfully!"
+
+      - name: Deployment failed
+        if: failure()
+        run: echo "❌ Deployment failed!"
