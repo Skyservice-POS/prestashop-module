@@ -69,7 +69,7 @@ class SkyService extends Module
     {
         $this->name = 'skyservice';
         $this->tab = 'administration';
-        $this->version = '0.4.1';
+        $this->version = '0.4.2';
         $this->author = 'SkyService';
         $this->need_instance = 0;
         $this->bootstrap = true;
@@ -480,8 +480,12 @@ class SkyService extends Module
             $delivery = array_merge($delivery, $carrier);
         }
 
+        $products = $order->getProducts();
+        $customizations = $this->getOrderCustomizations($products, $idLang, (int) $order->id_shop);
+
         $lines = [];
-        foreach ($order->getProducts() as $product) {
+        foreach ($products as $product) {
+            $idCustomization = (int) (isset($product['id_customization']) ? $product['id_customization'] : 0);
             $lines[] = [
                 'key' => (int) $product['product_id'] . ':' . (int) $product['product_attribute_id'],
                 'productId' => (int) $product['product_id'],
@@ -494,6 +498,8 @@ class SkyService extends Module
                 'quantity' => (float) $product['product_quantity'],
                 'price' => (float) $product['unit_price_tax_incl'],
                 'total' => (float) $product['total_price_tax_incl'],
+                // Кастомізація товару (текст на чашці тощо): [{name, value, type: text|file}]
+                'customizations' => isset($customizations[$idCustomization]) ? $customizations[$idCustomization] : [],
             ];
         }
 
@@ -533,6 +539,54 @@ class SkyService extends Module
             'shopUrl' => $this->getShopBaseUrl(),
             'langIso' => (string) Language::getIsoById($idLang),
         ];
+    }
+
+    /**
+     * Кастомізації рядків замовлення ОДНИМ запитом: id_customization => [{name, value, type}].
+     *
+     * Кожна кастомізація в замовленні — окремий рядок order_detail зі своїм id_customization,
+     * тож групуємо саме за ним. Файлове поле (type 0) зберігає імʼя файлу в upload/ — каса
+     * його не відкриє, тому шлемо лише назву поля з порожнім значенням.
+     *
+     * @param array $products Рядки з Order::getProducts()
+     * @param int   $idLang
+     * @param int   $idShop
+     * @return array<int, array<int, array{name: string, value: string, type: string}>>
+     */
+    private function getOrderCustomizations(array $products, $idLang, $idShop)
+    {
+        $ids = [];
+        foreach ($products as $product) {
+            if (!empty($product['id_customization'])) {
+                $ids[] = (int) $product['id_customization'];
+            }
+        }
+        if (!$ids) {
+            return [];
+        }
+
+        $rows = Db::getInstance()->executeS(
+            'SELECT cd.`id_customization`, cd.`type`, cd.`value`, cfl.`name`
+             FROM `' . _DB_PREFIX_ . 'customized_data` cd
+             LEFT JOIN `' . _DB_PREFIX_ . 'customization_field_lang` cfl
+                ON cfl.`id_customization_field` = cd.`index`
+               AND cfl.`id_lang` = ' . (int) $idLang . '
+               AND cfl.`id_shop` = ' . (int) $idShop . '
+             WHERE cd.`id_customization` IN (' . implode(',', array_unique($ids)) . ')
+             ORDER BY cd.`id_customization` ASC, cd.`index` ASC'
+        );
+
+        $result = [];
+        foreach ($rows ?: [] as $row) {
+            $isFile = (int) $row['type'] === (int) Product::CUSTOMIZE_FILE;
+            $result[(int) $row['id_customization']][] = [
+                'name' => (string) $row['name'],
+                'value' => $isFile ? '' : (string) $row['value'],
+                'type' => $isFile ? 'file' : 'text',
+            ];
+        }
+
+        return $result;
     }
 
     /**
