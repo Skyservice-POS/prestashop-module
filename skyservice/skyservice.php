@@ -13,6 +13,14 @@
  * Доставка: одна спроба синхронно в хуку (щоб не тримати checkout), при невдачі —
  * рядок в outbox і повтор на наступному хуку. Ретраї ми контролюємо самі, тому бек може
  * відповідати чесним 5xx, а не завжди 200, як доводиться в WooCommerce-приймачі.
+ *
+ * Жодне замовлення не має пропасти через вимкнення (тікет #8287):
+ * - перемикач «Увімкнено» = Ні → події йдуть в outbox, але не відправляються; після
+ *   ввімкнення їх доштовхує збереження форми або наступний хук;
+ * - модуль вимкнено в менеджері модулів → хуки не викликаються зовсім. Для цього є курсор
+ *   SKYSERVICE_LAST_ORDER_ID (останнє врахованe замовлення): усе, що новіше за нього й не
+ *   лежить в outbox, догружається при ввімкненні модуля та на кожному хуку.
+ * Повторна доставка безпечна — бек дедуплікує замовлення за orderId.
  */
 if (!defined('_PS_VERSION_')) {
     exit;
@@ -29,6 +37,19 @@ class SkyService extends Module
     /** Таймаут HTTP до беку, сек. Свідомо короткий: checkout важливіший за інтеграцію */
     const HTTP_TIMEOUT = 5;
 
+    /** Скільки пропущених замовлень догружаємо в outbox за один виклик */
+    const CATCH_UP_LIMIT = 50;
+
+    /**
+     * id_reference коробкового перевізника «Click and collect» (install/data/xml/carrier.xml).
+     * Саме reference, а не id_carrier: кожне редагування перевізника в адмінці створює новий
+     * id_carrier, а reference лишається тим самим.
+     */
+    const CORE_PICKUP_CARRIER_REFERENCE = 1;
+
+    /** Слова в назві/строку доставки перевізника, за якими вгадуємо самовивіз при встановленні */
+    const PICKUP_CARRIER_PATTERN = '/pick\\s*-?\\s*up|click\\s*(&|and|\\+)?\\s*collect|in-?store|самовив|самовыв|з магазину|из магазина/iu';
+
     /** @var string накопичувач HTML для сторінки налаштувань */
     private $html = '';
 
@@ -36,7 +57,7 @@ class SkyService extends Module
     {
         $this->name = 'skyservice';
         $this->tab = 'administration';
-        $this->version = '0.1.0';
+        $this->version = '0.4.0';
         $this->author = 'SkyService';
         $this->need_instance = 0;
         $this->bootstrap = true;
@@ -59,7 +80,37 @@ class SkyService extends Module
             && Configuration::updateValue('SKYSERVICE_ENABLED', 0)
             && Configuration::updateValue('SKYSERVICE_API_URL', '')
             && Configuration::updateValue('SKYSERVICE_COMPANY_ID', '')
-            && Configuration::updateValue('SKYSERVICE_SECRET', '');
+            && Configuration::updateValue('SKYSERVICE_SECRET', '')
+            && Configuration::updateValue('SKYSERVICE_PICKUP_CARRIERS', json_encode($this->detectPickupCarrierReferences()))
+            // Історію магазину до встановлення модуля на касу не тягнемо
+            && Configuration::updateValue('SKYSERVICE_LAST_ORDER_ID', self::getMaxOrderId());
+    }
+
+    /**
+     * Ввімкнення в менеджері модулів. Поки модуль був вимкнений, ядро не викликало хуків,
+     * тож замовлення того періоду ніде не зафіксовані — догружаємо їх за курсором і одразу
+     * пробуємо доставити, не чекаючи наступного замовлення.
+     */
+    public function enable($force_all = false)
+    {
+        if (!parent::enable($force_all)) {
+            return false;
+        }
+
+        try {
+            $this->catchUpMissedOrders();
+            $this->flushOutbox();
+        } catch (Throwable $e) {
+            PrestaShopLogger::addLog('SkyService: catch-up on enable failed — ' . $e->getMessage(), 3, null, 'Order', 0, true);
+        }
+
+        return true;
+    }
+
+    /** @return int */
+    public static function getMaxOrderId()
+    {
+        return (int) Db::getInstance()->getValue('SELECT MAX(`id_order`) FROM `' . _DB_PREFIX_ . 'orders`');
     }
 
     public function uninstall()
@@ -70,7 +121,92 @@ class SkyService extends Module
             && Configuration::deleteByName('SKYSERVICE_ENABLED')
             && Configuration::deleteByName('SKYSERVICE_API_URL')
             && Configuration::deleteByName('SKYSERVICE_COMPANY_ID')
-            && Configuration::deleteByName('SKYSERVICE_SECRET');
+            && Configuration::deleteByName('SKYSERVICE_SECRET')
+            && Configuration::deleteByName('SKYSERVICE_LAST_ORDER_ID')
+            && Configuration::deleteByName('SKYSERVICE_PICKUP_CARRIERS');
+    }
+
+    // ------------------------------------------------------- перевізники
+
+    /**
+     * Перевізники магазину для форми налаштувань (і модульні теж — самовивіз буває й модулем).
+     *
+     * @return array<int, array{reference:int, name:string, delay:string}>
+     */
+    private function getShopCarriers()
+    {
+        $idLang = (int) Configuration::get('PS_LANG_DEFAULT');
+        $carriers = [];
+        foreach (Carrier::getCarriers($idLang, false, false, false, null, Carrier::ALL_CARRIERS) as $row) {
+            $carriers[] = [
+                'reference' => (int) $row['id_reference'],
+                'name' => $this->getCarrierDisplayName((string) $row['name']),
+                'delay' => (string) $row['delay'],
+            ];
+        }
+
+        return $carriers;
+    }
+
+    /** Перевізник із назвою «0» — це «назва магазину» (так ядро позначає перевізника за замовчуванням) */
+    private function getCarrierDisplayName($name)
+    {
+        return $name === '0' ? (string) Configuration::get('PS_SHOP_NAME') : $name;
+    }
+
+    /**
+     * Початковий перелік самовивозів, щоб модуль працював «з коробки»: коробковий
+     * «Click and collect» плюс перевізники, у назві чи строку доставки яких є «самовивіз»,
+     * «pickup» тощо. Далі власник магазину править перелік у налаштуваннях модуля.
+     *
+     * @return int[] id_reference
+     */
+    public function detectPickupCarrierReferences()
+    {
+        $references = [];
+        foreach ($this->getShopCarriers() as $carrier) {
+            if ($carrier['reference'] === self::CORE_PICKUP_CARRIER_REFERENCE
+                || preg_match(self::PICKUP_CARRIER_PATTERN, $carrier['name'] . ' ' . $carrier['delay'])
+            ) {
+                $references[] = $carrier['reference'];
+            }
+        }
+
+        return array_values(array_unique($references));
+    }
+
+    /** @return int[] id_reference перевізників, які означають самовивіз */
+    private function getPickupCarrierReferences()
+    {
+        $references = json_decode((string) Configuration::get('SKYSERVICE_PICKUP_CARRIERS'), true);
+
+        return is_array($references) ? array_map('intval', $references) : [];
+    }
+
+    /**
+     * Перевізник замовлення для беку. Самовивіз визначає саме він, а не адреса: PrestaShop
+     * вимагає адресу на чекауті навіть для «Click and collect» (тікет #8283).
+     *
+     * @return array|null
+     */
+    private function buildCarrierPayload(Order $order, $idLang)
+    {
+        if (!$order->id_carrier) {
+            return null;
+        }
+
+        $carrier = new Carrier((int) $order->id_carrier, (int) $idLang);
+        if (!Validate::isLoadedObject($carrier)) {
+            return null;
+        }
+
+        return [
+            'carrierId' => (int) $carrier->id,
+            'carrierReference' => (int) $carrier->id_reference,
+            'carrierName' => $this->getCarrierDisplayName((string) $carrier->name),
+            'carrierDelay' => (string) $carrier->delay,
+            'isPickup' => in_array((int) $carrier->id_reference, $this->getPickupCarrierReferences(), true),
+        ];
     }
 
     /**
@@ -107,9 +243,15 @@ class SkyService extends Module
             return;
         }
 
+        $idOrder = (int) $params['order']->id;
+
         try {
+            // Спершу — замовлення, пропущені до цього (поточне виключаємо: його відправляє
+            // dispatch нижче), потім outbox, щоб старі доїхали разом із цим
+            $this->catchUpMissedOrders($idOrder);
             $this->flushOutbox();
             $this->dispatch('order.created', $this->buildOrderPayload($params['order']));
+            $this->advanceOrderCursor($idOrder);
         } catch (Throwable $e) {
             PrestaShopLogger::addLog('SkyService: validateOrder hook failed — ' . $e->getMessage(), 3, null, 'Order', (int) $params['order']->id, true);
         }
@@ -130,6 +272,7 @@ class SkyService extends Module
         }
 
         try {
+            $this->catchUpMissedOrders();
             $this->flushOutbox();
             $this->dispatchStatusUpdate($order, $params['newOrderStatus']);
         } catch (Throwable $e) {
@@ -142,6 +285,13 @@ class SkyService extends Module
         $this->dispatch('order.status_updated', [
             'orderId' => (int) $order->id,
             'reference' => $order->reference,
+            // Платіжний контекст їде РАЗОМ із подією, а не добирається беком: саме ця
+            // подія (а не створення замовлення) приносить на касу факт оплати карткою.
+            'paymentModule' => (string) $order->module,
+            'paymentMethod' => (string) $order->payment,
+            'paymentState' => $this->resolvePaymentState($order, $newStatus->id),
+            'totalPaid' => (float) $order->total_paid,
+            'totalPaidReal' => (float) $order->total_paid_real,
             'status' => [
                 'id' => (int) $newStatus->id,
                 'name' => (string) $newStatus->name[(int) Configuration::get('PS_LANG_DEFAULT')],
@@ -152,6 +302,60 @@ class SkyService extends Module
                 'refunded' => (bool) ($newStatus->id == Configuration::get('PS_OS_REFUND')),
             ],
         ]);
+    }
+
+    /**
+     * Зводить стан оплати замовлення до значень, які розуміє бек:
+     * paid | paid_unverified | preauth | pending.
+     *
+     * Чому не досить прапора `paid` самого PrestaShop. Платіжні шлюзи не зобовʼязані
+     * користуватися коробковими статусами й часто створюють власні. Portmone
+     * (офіційний модуль `portmone`) додає три — PORTMONE_PAID,
+     * PORTMONE_PAID_BUT_NOT_VERIFIED, PORTMONE_PREAUTH — і ВСІМ ставить `paid = 1`.
+     * Через це `hasBeenPaid()` повертає true й на блокуванні коштів (PREAUTH), де гроші
+     * ще не списані: каса вважала б таке замовлення сплаченим і віддала товар.
+     * Розрізнити стани можна лише за id, які модуль поклав у Configuration, — і це
+     * єдине місце, де вони доступні, тож нормалізація живе тут, а не на беку.
+     *
+     * @param Order    $order
+     * @param int|null $stateId Статус, у який замовлення переходить (з хука
+     *                          actionOrderStatusPostUpdate). Без нього беремо поточний.
+     * @return string
+     */
+    private function resolvePaymentState(Order $order, $stateId = null)
+    {
+        $stateId = $stateId === null ? (int) $order->getCurrentState() : (int) $stateId;
+
+        if ($order->module === 'portmone') {
+            // PORTMONE_ERROR (відмова за платежем) у версії 2.1.1 створюється ТИМ САМИМ
+            // addOrderState(), тобто теж із paid = 1 — відхилений платіж виглядає для
+            // магазину оплаченим. Тому він тут явно зводиться до 'pending'.
+            // У 1.6 цього стану немає, модуль користується PS_OS_ERROR;
+            // Configuration::get() на відсутньому ключі дає false → 0 → просто не збігається.
+            $portmoneStates = [
+                'PORTMONE_PAID' => 'paid',
+                'PORTMONE_PAID_BUT_NOT_VERIFIED' => 'paid_unverified',
+                'PORTMONE_PREAUTH' => 'preauth',
+                'PORTMONE_ERROR' => 'pending',
+            ];
+
+            foreach ($portmoneStates as $configKey => $state) {
+                $configured = (int) Configuration::get($configKey);
+                if ($configured !== 0 && $configured === $stateId) {
+                    return $state;
+                }
+            }
+        }
+
+        // Решта шлюзів і коробкові статуси: віримо прапору магазину. Перевіряємо саме
+        // СТАН, у який переходимо, а не історію: інакше замовлення, яке колись було
+        // оплачене, а потім скасоване, назавжди лишалося б «оплаченим».
+        $state = new OrderState($stateId);
+        if (Validate::isLoadedObject($state)) {
+            return $state->paid ? 'paid' : 'pending';
+        }
+
+        return $order->hasBeenPaid() ? 'paid' : 'pending';
     }
 
     // -------------------------------------------------------------- payload
@@ -178,6 +382,22 @@ class SkyService extends Module
             if (Validate::isLoadedObject($candidate)) {
                 $address = $candidate;
             }
+        }
+
+        // Адреса + перевізник. isPickup = перевізник у переліку самовивозів із налаштувань;
+        // адресу шлемо й для самовивозу — з неї бек заповнює картку нового клієнта
+        $delivery = [];
+        if ($address) {
+            $delivery = [
+                'city' => (string) $address->city,
+                'address' => trim($address->address1 . ' ' . $address->address2),
+                'postcode' => (string) $address->postcode,
+                'country' => (string) Country::getIsoById((int) $address->id_country),
+            ];
+        }
+        $carrier = $this->buildCarrierPayload($order, $idLang);
+        if ($carrier) {
+            $delivery = array_merge($delivery, $carrier);
         }
 
         $lines = [];
@@ -211,18 +431,26 @@ class SkyService extends Module
             'totalShipping' => (float) $order->total_shipping_tax_incl,
             'totalDiscount' => (float) $order->total_discounts_tax_incl,
             'paymentMethod' => (string) $order->payment,
+            // Технічна назва платіжного модуля (ps_wirepayment, ps_cashondelivery, …).
+            // Саме за нею бек визначає тип оплати: `payment` вище — це вітрина, вона
+            // локалізована («Payment by check» / «Оплата при отриманні») і як ключ не годиться.
+            'paymentModule' => (string) $order->module,
+            // Оплата очима магазину. На цьому хуку її майже завжди ще немає: ядро виконує
+            // actionValidateOrder РАНІШЕ, ніж OrderHistory проставить статус, тож історії
+            // станів не існує й hasBeenPaid() дає false навіть у шлюзів, які створюють
+            // замовлення вже оплаченим. Факт оплати доносить подія order.status_updated,
+            // а ці поля потрібні для рідкісного випадку, коли статус уже стоїть
+            // (наприклад, повторна доставка з outbox після зміни статусу).
+            'paid' => (bool) $order->hasBeenPaid(),
+            'paymentState' => $this->resolvePaymentState($order),
+            'totalPaidReal' => (float) $order->total_paid_real,
             'comment' => (string) $this->getOrderComment($order),
             'client' => [
                 'name' => trim($customer->firstname . ' ' . $customer->lastname),
                 'email' => (string) $customer->email,
                 'phone' => (string) $phone,
             ],
-            'delivery' => $address ? [
-                'city' => (string) $address->city,
-                'address' => trim($address->address1 . ' ' . $address->address2),
-                'postcode' => (string) $address->postcode,
-                'country' => (string) Country::getIsoById((int) $address->id_country),
-            ] : null,
+            'delivery' => $delivery ?: null,
             'lines' => $lines,
             'shopUrl' => $this->getShopBaseUrl(),
             'langIso' => (string) Language::getIsoById($idLang),
@@ -254,8 +482,14 @@ class SkyService extends Module
      */
     private function dispatch($event, array $payload)
     {
+        $idOrder = (int) (isset($payload['orderId']) ? $payload['orderId'] : 0);
+
         try {
+            // Вимкнено перемикачем — подію НЕ викидаємо, а відкладаємо: вона поїде, щойно
+            // модуль ввімкнуть (раніше тут був return, і замовлення зникали — тікет #8287)
             if (!Configuration::get('SKYSERVICE_ENABLED')) {
+                $this->enqueue($event, $idOrder, $payload, 'module disabled', 0, 0);
+
                 return;
             }
 
@@ -264,7 +498,7 @@ class SkyService extends Module
                 return;
             }
 
-            $this->enqueue($event, (int) (isset($payload['orderId']) ? $payload['orderId'] : 0), $payload, $result['error']);
+            $this->enqueue($event, $idOrder, $payload, $result['error']);
         } catch (Throwable $e) {
             // Саме Throwable, а не Exception: TypeError/Error з ядра магазину — теж наш ризик,
             // і пропущений назовні він зламає покупцеві оформлення замовлення.
@@ -338,16 +572,23 @@ class SkyService extends Module
         return ['ok' => true, 'error' => null, 'response' => $response];
     }
 
-    private function enqueue($event, $idOrder, array $payload, $error)
+    /**
+     * @param int $attempts  Скільки спроб уже витрачено: 1 після невдалої відправки,
+     *                       0 — подію ще не пробували слати (модуль вимкнено, догрузка)
+     * @param int $delaySec  Через скільки секунд пробувати: після невдачі — хвилина бекофу,
+     *                       щоб не бити лежачий бек на кожному checkout; відкладені без
+     *                       спроби — одразу, на першому ж хуку після ввімкнення
+     */
+    private function enqueue($event, $idOrder, array $payload, $error, $attempts = 1, $delaySec = 60)
     {
         Db::getInstance()->insert('skyservice_outbox', [
             'event' => pSQL($event),
             'id_order' => (int) $idOrder,
             'payload' => pSQL(json_encode($payload, JSON_UNESCAPED_UNICODE), true),
-            'attempts' => 1,
+            'attempts' => (int) $attempts,
             'last_error' => pSQL((string) $error, true),
             'date_add' => date('Y-m-d H:i:s'),
-            'date_next' => date('Y-m-d H:i:s', time() + 60),
+            'date_next' => date('Y-m-d H:i:s', time() + (int) $delaySec),
         ]);
 
         PrestaShopLogger::addLog('SkyService: delivery queued — ' . $error, 2, null, 'Order', (int) $idOrder, true);
@@ -362,6 +603,11 @@ class SkyService extends Module
      */
     private function flushOutbox()
     {
+        // Вимкнено — нічого не шлемо, черга чекає ввімкнення
+        if (!Configuration::get('SKYSERVICE_ENABLED')) {
+            return;
+        }
+
         $rows = Db::getInstance()->executeS(
             'SELECT * FROM `' . _DB_PREFIX_ . 'skyservice_outbox`
              WHERE `date_next` <= NOW() AND `attempts` < ' . (int) self::MAX_ATTEMPTS . '
@@ -393,6 +639,79 @@ class SkyService extends Module
                 'last_error' => pSQL((string) $result['error'], true),
                 'date_next' => date('Y-m-d H:i:s', time() + (60 * pow(2, min($attempts - 1, 4)))),
             ], '`id_outbox` = ' . (int) $row['id_outbox']);
+        }
+    }
+
+    /**
+     * Ставить в outbox замовлення, створені в обхід хука (модуль був вимкнений у менеджері
+     * модулів), тобто новіші за курсор, яких ще немає в outbox.
+     *
+     * Скасовані й помилкові замовлення пропускаємо: на касі їм нема чого робити. Решта йде
+     * з ПОТОЧНИМ станом замовлення — якщо його встигли оплатити, каса побачить оплату одразу.
+     *
+     * @param int $exceptOrderId Замовлення, яке зараз відправляє сам хук — його не дублюємо
+     */
+    private function catchUpMissedOrders($exceptOrderId = 0)
+    {
+        $cursor = Configuration::get('SKYSERVICE_LAST_ORDER_ID');
+        if ($cursor === false || $cursor === null || $cursor === '') {
+            // Встановлено до версії з курсором і без апгрейд-скрипта — стартуємо з поточного
+            // стану, а не тягнемо на касу всю історію магазину
+            Configuration::updateValue('SKYSERVICE_LAST_ORDER_ID', self::getMaxOrderId());
+
+            return;
+        }
+        $cursor = (int) $cursor;
+
+        $skipStates = array_filter([
+            (int) Configuration::get('PS_OS_CANCELED'),
+            (int) Configuration::get('PS_OS_ERROR'),
+        ]);
+
+        $rows = Db::getInstance()->executeS(
+            'SELECT o.`id_order`, o.`current_state` FROM `' . _DB_PREFIX_ . 'orders` o
+             WHERE o.`id_order` > ' . $cursor . '
+               AND o.`id_order` <> ' . (int) $exceptOrderId . '
+               AND NOT EXISTS (
+                   SELECT 1 FROM `' . _DB_PREFIX_ . 'skyservice_outbox` ob
+                   WHERE ob.`id_order` = o.`id_order` AND ob.`event` = \'order.created\'
+               )
+             ORDER BY o.`id_order` ASC
+             LIMIT ' . (int) self::CATCH_UP_LIMIT
+        );
+
+        if (!$rows) {
+            return;
+        }
+
+        $lastId = $cursor;
+        foreach ($rows as $row) {
+            $idOrder = (int) $row['id_order'];
+            $lastId = max($lastId, $idOrder);
+
+            if (in_array((int) $row['current_state'], $skipStates, true)) {
+                continue;
+            }
+
+            $order = new Order($idOrder);
+            if (!Validate::isLoadedObject($order)) {
+                continue;
+            }
+
+            $this->enqueue('order.created', $idOrder, $this->buildOrderPayload($order), 'missed while module was disabled', 0, 0);
+        }
+
+        $this->advanceOrderCursor($lastId);
+    }
+
+    /**
+     * Курсор лише зростає: паралельний checkout зі старшим id не має відкотити його назад
+     * (інакше те саме замовлення догрузилось би вдруге — не страшно, бек дедуплікує, але зайве).
+     */
+    private function advanceOrderCursor($idOrder)
+    {
+        if ((int) $idOrder > (int) Configuration::get('SKYSERVICE_LAST_ORDER_ID')) {
+            Configuration::updateValue('SKYSERVICE_LAST_ORDER_ID', (int) $idOrder);
         }
     }
 
@@ -430,13 +749,29 @@ class SkyService extends Module
 
         Configuration::updateValue('SKYSERVICE_API_URL', $apiUrl);
         Configuration::updateValue('SKYSERVICE_COMPANY_ID', $companyId);
-        Configuration::updateValue('SKYSERVICE_ENABLED', (int) Tools::getValue('SKYSERVICE_ENABLED'));
+        $wasEnabled = (bool) Configuration::get('SKYSERVICE_ENABLED');
+        $isEnabled = (bool) Tools::getValue('SKYSERVICE_ENABLED');
+        Configuration::updateValue('SKYSERVICE_ENABLED', (int) $isEnabled);
+        $pickupReferences = [];
+        foreach ($this->getShopCarriers() as $carrier) {
+            if (Tools::getValue('SKYSERVICE_PICKUP_CARRIERS_' . $carrier['reference'])) {
+                $pickupReferences[] = $carrier['reference'];
+            }
+        }
+        Configuration::updateValue('SKYSERVICE_PICKUP_CARRIERS', json_encode(array_values(array_unique($pickupReferences))));
         // Порожнє поле секрету означає «лишити як є» — щоб збереження форми не стирало ключ
         if ($secret !== '') {
             Configuration::updateValue('SKYSERVICE_SECRET', $secret);
         }
 
         $this->html .= $this->displayConfirmation($this->l('Налаштування збережено'));
+
+        // Щойно ввімкнули — одразу доставляємо накопичене за час вимкнення, а не чекаємо
+        // наступного замовлення (у тихому магазині воно може бути й завтра)
+        if ($isEnabled && !$wasEnabled) {
+            $this->catchUpMissedOrders();
+            $this->flushOutbox();
+        }
     }
 
     /**
@@ -481,6 +816,22 @@ class SkyService extends Module
 
     private function renderForm()
     {
+        $pickupReferences = $this->getPickupCarrierReferences();
+        $carrierOptions = [];
+        $pickupValues = [];
+        foreach ($this->getShopCarriers() as $carrier) {
+            // Модульні перевізники можуть мати однаковий reference у кількох рядках — показуємо раз
+            if (isset($pickupValues['SKYSERVICE_PICKUP_CARRIERS_' . $carrier['reference']])) {
+                continue;
+            }
+            $carrierOptions[] = [
+                'id' => $carrier['reference'],
+                'name' => $carrier['name'] . ($carrier['delay'] !== '' ? ' — ' . $carrier['delay'] : ''),
+            ];
+            $pickupValues['SKYSERVICE_PICKUP_CARRIERS_' . $carrier['reference']] =
+                in_array($carrier['reference'], $pickupReferences, true);
+        }
+
         $fields = [
             'form' => [
                 'legend' => ['title' => $this->l('Підключення до SkyService'), 'icon' => 'icon-cogs'],
@@ -490,7 +841,7 @@ class SkyService extends Module
                         'label' => $this->l('Увімкнено'),
                         'name' => 'SKYSERVICE_ENABLED',
                         'is_bool' => true,
-                        'desc' => $this->l('Поки вимкнено, замовлення в SkyService не передаються.'),
+                        'desc' => $this->l('Поки вимкнено, замовлення накопичуються й будуть передані в SkyService після ввімкнення.'),
                         'values' => [
                             ['id' => 'on', 'value' => 1, 'label' => $this->l('Так')],
                             ['id' => 'off', 'value' => 0, 'label' => $this->l('Ні')],
@@ -514,6 +865,17 @@ class SkyService extends Module
                         'label' => $this->l('Секрет підпису'),
                         'name' => 'SKYSERVICE_SECRET',
                         'desc' => $this->l('Видається в налаштуваннях інтеграції SkyService. Порожнє поле — лишити поточний.'),
+                    ],
+                    [
+                        'type' => 'checkbox',
+                        'label' => $this->l('Самовивіз'),
+                        'name' => 'SKYSERVICE_PICKUP_CARRIERS',
+                        'desc' => $this->l('Перевізники, які означають самовивіз. Такі замовлення каса покаже як самовивіз, без адреси доставки.'),
+                        'values' => [
+                            'query' => $carrierOptions,
+                            'id' => 'id',
+                            'name' => 'name',
+                        ],
                     ],
                 ],
                 'submit' => ['title' => $this->l('Зберегти'), 'name' => 'submitSkyServiceConfig'],
@@ -539,7 +901,7 @@ class SkyService extends Module
             . '&configure=' . $this->name . '&tab_module=' . $this->tab . '&module_name=' . $this->name;
         $helper->token = Tools::getAdminTokenLite('AdminModules');
         $helper->tpl_vars = [
-            'fields_value' => [
+            'fields_value' => $pickupValues + [
                 'SKYSERVICE_ENABLED' => (int) Configuration::get('SKYSERVICE_ENABLED'),
                 'SKYSERVICE_API_URL' => Configuration::get('SKYSERVICE_API_URL'),
                 'SKYSERVICE_COMPANY_ID' => Configuration::get('SKYSERVICE_COMPANY_ID'),

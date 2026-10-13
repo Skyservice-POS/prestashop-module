@@ -2,7 +2,7 @@
 <module>
 	<name>skyservice</name>
 	<displayName><![CDATA[SkyService — синхронізація замовлень]]></displayName>
-	<version><![CDATA[0.1.0]]></version>
+	<version><![CDATA[0.4.0]]></version>
 	<description><![CDATA[Передає замовлення магазину в SkyService POS у момент підтвердження.]]></description>
 	<author><![CDATA[SkyService]]></author>
 	<tab><![CDATA[administration]]></tab>
