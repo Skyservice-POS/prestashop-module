@@ -53,11 +53,23 @@ class SkyService extends Module
     /** @var string накопичувач HTML для сторінки налаштувань */
     private $html = '';
 
+    /**
+     * Замовлення, провалідовані в ЦЬОМУ запиті, order.created яких відкладено до кінця
+     * запиту (id_order => true). Статичне, бо гарантії, що всі хуки запиту прийдуть в один
+     * екземпляр модуля, ядро не дає.
+     *
+     * @var array<int, bool>
+     */
+    private static $pendingCreated = [];
+
+    /** @var bool shutdown-обробник відкладених order.created уже зареєстровано */
+    private static $shutdownRegistered = false;
+
     public function __construct()
     {
         $this->name = 'skyservice';
         $this->tab = 'administration';
-        $this->version = '0.4.0';
+        $this->version = '0.4.1';
         $this->author = 'SkyService';
         $this->need_instance = 0;
         $this->bootstrap = true;
@@ -235,7 +247,16 @@ class SkyService extends Module
 
     /**
      * Замовлення підтверджене (створене й провалідоване платіжним модулем).
-     * Це і є момент, коли воно має зʼявитись на касі.
+     *
+     * order.created тут НЕ шлемо, а відкладаємо до кінця запиту. Ядро
+     * (`PaymentModule::validateOrder()`) виконує цей хук РАНІШЕ, ніж проставить статус, тож
+     * у цей момент оплати не видно навіть у шлюзів, що створюють замовлення вже оплаченим
+     * (Portmone 2.x). Раніше це давало дві події на одну оплату: order.created «неоплачене»
+     * і одразу order.status_updated з оплатою. Тепер в кінці запиту замовлення
+     * перечитується з уже записаним статусом і їде однією подією.
+     *
+     * Курсор зсуваємо теж лише після відправки: якщо процес помре раніше, замовлення
+     * догрузить catchUpMissedOrders на наступному хуку (бек дедуплікує повтори).
      */
     public function hookActionValidateOrder(array $params)
     {
@@ -246,14 +267,44 @@ class SkyService extends Module
         $idOrder = (int) $params['order']->id;
 
         try {
-            // Спершу — замовлення, пропущені до цього (поточне виключаємо: його відправляє
-            // dispatch нижче), потім outbox, щоб старі доїхали разом із цим
-            $this->catchUpMissedOrders($idOrder);
+            self::$pendingCreated[$idOrder] = true;
+            if (!self::$shutdownRegistered) {
+                register_shutdown_function([$this, 'dispatchPendingCreated']);
+                self::$shutdownRegistered = true;
+            }
+
+            // Спершу — замовлення, пропущені до цього (відкладені в цьому запиті виключаємо:
+            // їх відправить dispatchPendingCreated), потім outbox
+            $this->catchUpMissedOrders(array_keys(self::$pendingCreated));
             $this->flushOutbox();
-            $this->dispatch('order.created', $this->buildOrderPayload($params['order']));
-            $this->advanceOrderCursor($idOrder);
         } catch (Throwable $e) {
             PrestaShopLogger::addLog('SkyService: validateOrder hook failed — ' . $e->getMessage(), 3, null, 'Order', (int) $params['order']->id, true);
+        }
+    }
+
+    /**
+     * Shutdown-обробник: відправляє відкладені order.created із фінальним станом замовлення.
+     *
+     * Публічний лише тому, що його викликає register_shutdown_function. Виняток назовні не
+     * летить: на shutdown його вже нікому зловити, а замовлення догрузить курсор.
+     */
+    public function dispatchPendingCreated()
+    {
+        $pending = array_keys(self::$pendingCreated);
+        self::$pendingCreated = [];
+        sort($pending);
+
+        foreach ($pending as $idOrder) {
+            try {
+                // Свіжий обʼєкт, а не той, що прийшов у хук: у того current_state ще порожній
+                $order = new Order((int) $idOrder);
+                if (Validate::isLoadedObject($order)) {
+                    $this->dispatch('order.created', $this->buildOrderPayload($order));
+                }
+                $this->advanceOrderCursor($idOrder);
+            } catch (Throwable $e) {
+                PrestaShopLogger::addLog('SkyService: deferred order.created failed — ' . $e->getMessage(), 3, null, 'Order', (int) $idOrder, true);
+            }
         }
     }
 
@@ -266,13 +317,19 @@ class SkyService extends Module
             return;
         }
 
+        // Перший статус замовлення, створеного в цьому ж запиті: окрему подію не шлемо,
+        // стан поїде всередині відкладеного order.created (див. hookActionValidateOrder)
+        if (isset(self::$pendingCreated[(int) $params['id_order']])) {
+            return;
+        }
+
         $order = new Order((int) $params['id_order']);
         if (!Validate::isLoadedObject($order)) {
             return;
         }
 
         try {
-            $this->catchUpMissedOrders();
+            $this->catchUpMissedOrders(array_keys(self::$pendingCreated));
             $this->flushOutbox();
             $this->dispatchStatusUpdate($order, $params['newOrderStatus']);
         } catch (Throwable $e) {
@@ -294,7 +351,7 @@ class SkyService extends Module
             'totalPaidReal' => (float) $order->total_paid_real,
             'status' => [
                 'id' => (int) $newStatus->id,
-                'name' => (string) $newStatus->name[(int) Configuration::get('PS_LANG_DEFAULT')],
+                'name' => $this->resolveStatusName($newStatus),
                 'paid' => (bool) $newStatus->paid,
                 'shipped' => (bool) $newStatus->shipped,
                 // Скасування/повернення бек трактує як привід повернути залишок
@@ -302,6 +359,29 @@ class SkyService extends Module
                 'refunded' => (bool) ($newStatus->id == Configuration::get('PS_OS_REFUND')),
             ],
         ]);
+    }
+
+    /**
+     * Назва статусу для каси.
+     *
+     * Ядро в actionOrderStatusPostUpdate передає OrderState, завантажений З МОВОЮ
+     * (`new OrderState($id, $order->id_lang)`), тож `name` там рядок, а не масив по мовах.
+     * Індекс по рядку (`$name[1]`) повертав один БАЙТ: для кирилиці це обрізок
+     * багатобайтного символу, json_encode на ньому падав, і подія йшла з порожнім тілом —
+     * оплата Portmone так і не доїжджала на касу.
+     *
+     * @param OrderState $status
+     * @return string
+     */
+    private function resolveStatusName($status)
+    {
+        $name = $status->name;
+        if (is_array($name)) {
+            $idLang = (int) Configuration::get('PS_LANG_DEFAULT');
+            $name = isset($name[$idLang]) ? $name[$idLang] : reset($name);
+        }
+
+        return (string) $name;
     }
 
     /**
@@ -435,12 +515,10 @@ class SkyService extends Module
             // Саме за нею бек визначає тип оплати: `payment` вище — це вітрина, вона
             // локалізована («Payment by check» / «Оплата при отриманні») і як ключ не годиться.
             'paymentModule' => (string) $order->module,
-            // Оплата очима магазину. На цьому хуку її майже завжди ще немає: ядро виконує
-            // actionValidateOrder РАНІШЕ, ніж OrderHistory проставить статус, тож історії
-            // станів не існує й hasBeenPaid() дає false навіть у шлюзів, які створюють
-            // замовлення вже оплаченим. Факт оплати доносить подія order.status_updated,
-            // а ці поля потрібні для рідкісного випадку, коли статус уже стоїть
-            // (наприклад, повторна доставка з outbox після зміни статусу).
+            // Оплата очима магазину. order.created відправляється в кінці запиту, коли ядро
+            // вже проставило статус (hookActionValidateOrder), тож оплата шлюзу, що створює
+            // замовлення оплаченим (Portmone 2.x), їде одразу тут. Пізніші зміни оплати
+            // (PAID_BUT_NOT_VERIFIED → PAID колбеком) доносить order.status_updated.
             'paid' => (bool) $order->hasBeenPaid(),
             'paymentState' => $this->resolvePaymentState($order),
             'totalPaidReal' => (float) $order->total_paid_real,
@@ -522,7 +600,13 @@ class SkyService extends Module
             return ['ok' => false, 'error' => 'module is not configured'];
         }
 
-        $body = json_encode($payload, JSON_UNESCAPED_UNICODE);
+        // Битий UTF-8 у будь-якому полі (назва статусу, адреса з чужого модуля) не має
+        // перетворювати подію на порожнє тіло: json_encode тоді віддає false, curl шле "",
+        // а підпис від порожнього рядка на беку сходиться — подія «доставлена» і зникає
+        $body = json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE);
+        if ($body === false) {
+            return ['ok' => false, 'error' => 'json encode failed: ' . json_last_error_msg()];
+        }
         $url = rtrim($apiUrl, '/') . '/?section=prestashop&action=webhook&company=' . rawurlencode($companyId);
 
         $ch = curl_init($url);
@@ -584,7 +668,7 @@ class SkyService extends Module
         Db::getInstance()->insert('skyservice_outbox', [
             'event' => pSQL($event),
             'id_order' => (int) $idOrder,
-            'payload' => pSQL(json_encode($payload, JSON_UNESCAPED_UNICODE), true),
+            'payload' => pSQL(json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE), true),
             'attempts' => (int) $attempts,
             'last_error' => pSQL((string) $error, true),
             'date_add' => date('Y-m-d H:i:s'),
@@ -649,9 +733,10 @@ class SkyService extends Module
      * Скасовані й помилкові замовлення пропускаємо: на касі їм нема чого робити. Решта йде
      * з ПОТОЧНИМ станом замовлення — якщо його встигли оплатити, каса побачить оплату одразу.
      *
-     * @param int $exceptOrderId Замовлення, яке зараз відправляє сам хук — його не дублюємо
+     * @param int[] $exceptOrderIds Замовлення, відкладені в цьому запиті (їх відправить
+     *                              dispatchPendingCreated) — їх не дублюємо
      */
-    private function catchUpMissedOrders($exceptOrderId = 0)
+    private function catchUpMissedOrders(array $exceptOrderIds = [])
     {
         $cursor = Configuration::get('SKYSERVICE_LAST_ORDER_ID');
         if ($cursor === false || $cursor === null || $cursor === '') {
@@ -671,7 +756,7 @@ class SkyService extends Module
         $rows = Db::getInstance()->executeS(
             'SELECT o.`id_order`, o.`current_state` FROM `' . _DB_PREFIX_ . 'orders` o
              WHERE o.`id_order` > ' . $cursor . '
-               AND o.`id_order` <> ' . (int) $exceptOrderId . '
+               ' . ($exceptOrderIds ? 'AND o.`id_order` NOT IN (' . implode(',', array_map('intval', $exceptOrderIds)) . ')' : '') . '
                AND NOT EXISTS (
                    SELECT 1 FROM `' . _DB_PREFIX_ . 'skyservice_outbox` ob
                    WHERE ob.`id_order` = o.`id_order` AND ob.`event` = \'order.created\'
